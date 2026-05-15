@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+#
+# php-install — 基于 apt 的 PHP 多版本安装工具
+# 用法: php-install [选项] <版本> [额外包...]
+#
+set -euo pipefail
+
+# 解析符号链接，确保 lib/ 和 post-install/ 路径正确
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PHPENV_ROOT="${PHPENV_ROOT:-$HOME/.phpenv}"
+
+# ── 颜色 ──────────────────────────────────────────
+red='\033[0;31m'
+green='\033[0;32m'
+yellow='\033[1;33m'
+reset='\033[0m'
+
+log_info()  { printf "${green}[info]${reset} %s\n" "$*"; }
+log_warn()  { printf "${yellow}[warn]${reset} %s\n" "$*"; }
+log_error() { printf "${red}[error]${reset} %s\n" "$*"; }
+
+# ── 工具函数 ──────────────────────────────────────
+has_ppa_ondrej() {
+    # 兼容传统 .list 格式和 deb822 .sources 格式
+    grep -rE '^(deb|URIs:).*ondrej/php' /etc/apt/sources.list* &>/dev/null
+}
+
+add_ppa_ondrej() {
+    log_info "添加 ondrej/php PPA..."
+    sudo add-apt-repository -y ppa:ondrej/php
+    sudo apt-get update
+}
+
+# ── 安装阶段 ──────────────────────────────────────
+do_apt_install() {
+    local version="$1"
+    shift
+    local pkgs=("$@")
+
+    # 检查 PPA
+    if ! has_ppa_ondrej; then
+        add_ppa_ondrej
+    else
+        log_info "ondrej/php PPA 已存在"
+    fi
+
+    # 组装 apt 包名
+    local apt_pkgs=()
+    for pkg in "${pkgs[@]}"; do
+        apt_pkgs+=("php${version}-${pkg}")
+    done
+
+    # 安装 apt 包
+    log_info "安装包: ${apt_pkgs[*]}"
+    sudo apt-get install -y --no-install-recommends "${apt_pkgs[@]}"
+}
+
+# ── 安装后阶段 ────────────────────────────────────
+do_post_install() {
+    local version="$1"
+    shift
+    local pkgs=("$@")
+
+    log_info "执行安装后脚本..."
+    for pkg in "${pkgs[@]}"; do
+        local script="${SCRIPT_DIR}/post-install/${pkg}.sh"
+        if [[ -x "$script" ]]; then
+            log_info "执行 ${pkg} 安装后脚本..."
+            if ! "$script" "$version"; then
+                log_error "${pkg} 安装后脚本执行失败，继续处理下一个..."
+            fi
+        fi
+    done
+}
+
+# ── 主流程 ────────────────────────────────────────
+show_usage() {
+    cat <<'EOF'
+用法: php-install [选项] <版本> [额外包...]
+
+  基于 apt 的 PHP 多版本安装工具，支持 phpenv 集成。
+
+选项:
+  --no-install  仅执行安装后脚本，跳过 apt 安装
+  -h, --help    显示此帮助信息
+
+示例:
+  php-install 8.3                    # 安装默认包 + 执行安装后脚本
+  php-install --no-install 8.3       # 仅执行安装后脚本（如 dpkg 升级后恢复配置）
+  php-install 8.3 apache2            # 默认包 + apache2
+  php-install 8.3 apache2 grpc       # 默认包 + apache2 + grpc
+EOF
+}
+
+main() {
+    local no_install=0
+    local args=()
+
+    # 解析选项
+    for arg in "$@"; do
+        case "$arg" in
+            --no-install)
+                no_install=1
+                ;;
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            -*)
+                echo "未知选项: $arg"
+                show_usage
+                exit 1
+                ;;
+            *)
+                args+=("$arg")
+                ;;
+        esac
+    done
+
+    if [[ ${#args[@]} -lt 1 ]]; then
+        show_usage
+        exit 1
+    fi
+
+    local version="${args[0]}"
+    local extra_pkgs=("${args[@]:1}")
+
+    # 默认包 + 额外包（去重，保持顺序）
+    local default_pkgs=(
+        common
+        cli
+        fpm
+        bcmath
+        curl
+        intl
+        mbstring
+        memcached
+        mysql
+        opcache
+        pgsql
+        redis
+        swoole
+        xdebug
+        xml
+        zip
+    )
+
+    local pkgs=("${default_pkgs[@]}")
+    for pkg in "${extra_pkgs[@]}"; do
+        local found=0
+        for p in "${pkgs[@]}"; do
+            if [[ "$p" == "$pkg" ]]; then
+                found=1
+                break
+            fi
+        done
+        if [[ $found -eq 0 ]]; then
+            pkgs+=("$pkg")
+        fi
+    done
+
+    # 安装阶段（可选跳过）
+    if [[ $no_install -eq 0 ]]; then
+        do_apt_install "$version" "${pkgs[@]}"
+        log_info "PHP ${version} 安装完成"
+    else
+        log_info "跳过 apt 安装，仅执行安装后脚本"
+    fi
+
+    # 安装后阶段始终执行
+    do_post_install "$version" "${pkgs[@]}"
+    log_info "PHP ${version} 安装后脚本执行完成"
+}
+
+main "$@"
